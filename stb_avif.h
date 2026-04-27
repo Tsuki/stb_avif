@@ -1982,8 +1982,8 @@ static int stbi_avif__parse_av1_frame_header(const unsigned char *data, size_t s
       {
          volatile int force_compile = 1;
          if (force_compile) {
-            fprintf(stderr, "FRAME: base_q_idx=%u coded_lossless=%d delta_q_y_dc=%d delta_q_u_dc=%d delta_q_u_ac=%d delta_q_v_dc=%d delta_q_v_ac=%d using_qmatrix=%d\n",
-               base_q_idx, coded_lossless, delta_q_y_dc, delta_q_u_dc, delta_q_u_ac, delta_q_v_dc, delta_q_v_ac, using_qmatrix);
+             fprintf(stderr, "FRAME: base_q_idx=%u coded_lossless=%d delta_q_y_dc=%d delta_q_u_dc=%d delta_q_u_ac=%d delta_q_v_dc=%d delta_q_v_ac=%d using_qmatrix=%d delta_q_present=%d\n",
+                base_q_idx, coded_lossless, delta_q_y_dc, delta_q_u_dc, delta_q_u_ac, delta_q_v_dc, delta_q_v_ac, using_qmatrix, delta_q_present);
          }
       }
 
@@ -10251,21 +10251,22 @@ static void stbi_avif__av1_inverse_transform_2d_rect(int *coeffs, int txw, int t
      * For IDTX: identity4/8 multiply by 2 per dim (total 4, shift 2);
      * identity16 multiplies by 2*sqrt(2) per dim (total 8, shift 3);
      * identity32/64 multiply by 4 per dim (total 16, shift 4).
-     * For DCT/ADST: col_shift = log2(txw) + log2(txh) - 1 - row_shift
-     * so that total scaling = 2^(row_shift + col_shift + 1) = txw * txh */
-     {
-         int col_shift;
-         if (tx_type == 9 || tx_type == 10 || tx_type == 11) {
-            int max_dim = (txw > txh) ? txw : txh;
-            if (max_dim <= 8)       col_shift = 2;
-            else if (max_dim <= 16) col_shift = 3;
-            else                    col_shift = 4;
-         } else {
-            int lw = 0, lh = 0, t = txw;
-            while (t > 1) { ++lw; t >>= 1; }
-            t = txh; while (t > 1) { ++lh; t >>= 1; }
-            col_shift = lw + lh - 1 - row_shift;
-         }
+      * For DCT/ADST: col_shift = log2(txw) + log2(txh) - 2 - row_shift
+      * so that total scaling = 2^(row_shift + col_shift + 1) = txw * txh / 2
+      * AV1 convention: transform output is 2x orthonormal (compensated in qtables) */
+      {
+          int col_shift;
+          if (tx_type == 9 || tx_type == 10 || tx_type == 11) {
+             int max_dim = (txw > txh) ? txw : txh;
+             if (max_dim <= 8)       col_shift = 2;
+             else if (max_dim <= 16) col_shift = 3;
+             else                    col_shift = 4;
+          } else {
+             int lw = 0, lh = 0, t = txw;
+             while (t > 1) { ++lw; t >>= 1; }
+             t = txh; while (t > 1) { ++lh; t >>= 1; }
+             col_shift = lw + lh - 2 - row_shift;
+          }
        /* Column transforms: for each column j (0..txw-1), apply txh-point col transform */
        for (j = 0; j < txw; ++j) {
        int out[64];
@@ -10432,19 +10433,17 @@ static int stbi_avif__av1_read_coeffs_after_skip(
       eob_pt = (int)eob_pt_sym; /* keep for compatibility below */
     }
 
-    {
-       int eob_bits = (int)((ctx->rd.bptr - ctx->rd.buf) * 8 - ctx->rd.cnt);
-       fprintf(stderr, "  EOB_PT: eob_pt=%d tx2dszctx=%d bits=%d\n", eob_pt, tx2dszctx, eob_bits);
-    }
-
-     /* 3. Compute EOB from eob_pt_sym.
-         In AV1 spec: eob_pt > 1 gives scan position, need +1 for count.
-         sym=0 → eob=0, sym=1 → eob=1,
-         sym>1 → eob_bin=sym-2, hi_bit=adapt_bool, eob=((hi_bit|2)<<eob_bin)|literal(eob_bin)+1 */
-      {
-         if (eob_pt <= 1) {
-            eob = eob_pt + 1; /* sym 0 → eob=1, sym 1 → eob=2 */
-         } else {
+      /* 3. Compute EOB from eob_pt_sym.
+          AV1 spec §5.11.39:
+          eob_pt=0 → eob=0, eob_pt=1 → eob=1,
+          eob_pt>1 → eob_bin=eob_pt-2, hi_bit=adapt_bool,
+                     eob=((hi_bit|2)<<eob_bin)|literal(eob_bin)+1 */
+       {
+          if (eob_pt == 0) {
+             eob = 0;
+          } else if (eob_pt == 1) {
+             eob = 1;
+          } else {
             int eob_bin = eob_pt - 2;
             int ts2 = tx_ctx < 4 ? tx_ctx : 4;
             int hi_bit, lo_bits;
@@ -10456,11 +10455,6 @@ static int stbi_avif__av1_read_coeffs_after_skip(
          }
          if (eob > area) eob = area;
          if (eob < 1) { STBI_AVIF_FREE(scan_buf); return 0; }
-          if (eob_pt > 4) {
-             int eob_bits2 = (int)((ctx->rd.bptr - ctx->rd.buf) * 8 - ctx->rd.cnt);
-             fprintf(stderr, "  EOB decode: eob_pt=%d eob=%d area=%d tx2dszctx=%d bits=%d\n",
-                eob_pt, eob, area, tx2dszctx, eob_bits2);
-          }
       }
     if (eob > area) eob = area;
     if (eob < 1) { STBI_AVIF_FREE(scan_buf); return 0; }
@@ -10618,12 +10612,12 @@ static int stbi_avif__av1_read_coeffs_after_skip(
          }
          if (sign) dequant_val = -dequant_val;
 
-         if (pos < area) {
-            /* pos is column-major: col * txh + row. Convert to row-major for IDCT. */
-            int col = pos >> bhl; /* bhl = log2(txh), so col = pos / txh */
-            int row = pos - (col << bhl);
-            coeffs_out[row * txw + col] = dequant_val;
-         }
+          if (pos < area) {
+             /* scan tables return row-major: pos = row * txw + col */
+             int row = pos / txw;
+             int col = pos - row * txw;
+             coeffs_out[row * txw + col] = dequant_val;
+          }
 
          /* Track DC value for cul_level sign */
          if (pos == 0)
@@ -11440,9 +11434,9 @@ static int stbi_avif__av1_decode_coding_unit(stbi_avif__av1_decode_ctx *ctx,
           ctx->planes->width, ctx->planes->height,
           px, py, pw, ph, ctx->planes->bit_depth, y_mode, y_angle_delta);
     }
-    if (px == 0 && py == 0) {
-       fprintf(stderr, "  After pred: Y[0,0]=%hu mode=%u\n", ctx->planes->y[0], y_mode);
-    }
+      if (px == 0 && py == 0) {
+         fprintf(stderr, "  After pred: Y[0,0]=%hu mode=%u\n", ctx->planes->y[0], y_mode);
+      }
 
    /* Predict UV — skip for monochrome */
    if (!ctx->monochrome && cpw > 0u && cph > 0u) {
@@ -11550,21 +11544,8 @@ static int stbi_avif__av1_decode_coding_unit(stbi_avif__av1_decode_ctx *ctx,
                }
             }
 
-               if (px == 0 && py == 0) {
-                  fprintf(stderr, "  txb_skip CDF[%d,%d]: ts=%d ctx=%d cdf=[%u,%u]\n",
-                     tx_row, tx_col, ts_skip, txb_skip_ctx,
-                     ctx->txb_skip_cdf[ts_skip][txb_skip_ctx][0],
-                     ctx->txb_skip_cdf[ts_skip][txb_skip_ctx][1]);
-                  fprintf(stderr, "  RD state before txb_skip: dif=%016llx rng=%u cnt=%d\n",
-                     (unsigned long long)ctx->rd.dif, ctx->rd.rng, ctx->rd.cnt);
-               }
-                txb_skip = stbi_avif__av1_read_symbol_adapt(&ctx->rd,
-                   ctx->txb_skip_cdf[ts_skip][txb_skip_ctx], 2);
-
-                if (px == 16 && py == 0) {
-                   fprintf(stderr, "  TX[%d,%d]: txb_skip=%u txb_skip_ctx=%d dc_sign_ctx=%d tx_w=%u tx_h=%u\n",
-                      tx_row, tx_col, txb_skip, txb_skip_ctx, dc_sign_ctx_y, tx_w, tx_h);
-                }
+                 txb_skip = stbi_avif__av1_read_symbol_adapt(&ctx->rd,
+                    ctx->txb_skip_cdf[ts_skip][txb_skip_ctx], 2);
              if (!txb_skip) {
                unsigned int tx_type_sym = 0;
                int tx_type_actual = 0;
@@ -11619,17 +11600,17 @@ static int stbi_avif__av1_decode_coding_unit(stbi_avif__av1_decode_ctx *ctx,
                    (int)(tx_w <= 32u ? tx_w : 32u), (int)(tx_h <= 32u ? tx_h : 32u),
                    coeffs, seg_dc_qstep_y, seg_ac_qstep_y,
                    dc_sign_ctx_y, &cul_level);
-                if (px == 0 && py == 0 && tx_row == 0 && tx_col == 0) {
-                   fprintf(stderr, "  First TX: eob=%d tx_type=%d cul_level=%d qstep=%d/%d\n",
-                      eob, tx_type_actual, cul_level, seg_dc_qstep_y, seg_ac_qstep_y);
-                   if (eob > 0) {
-                      int ci;
-                      fprintf(stderr, "  First 8 coeffs: ");
-                      for (ci = 0; ci < (eob < 8 ? eob : 8); ++ci)
-                         fprintf(stderr, "%d ", coeffs[ci]);
-                      fprintf(stderr, "\n");
-                   }
-                }
+                  if (px == 0 && py == 0 && tx_row == 0 && tx_col == 0) {
+                     fprintf(stderr, "  First TX: eob=%d tx_type=%d cul_level=%d qstep=%d/%d\n",
+                        eob, tx_type_actual, cul_level, seg_dc_qstep_y, seg_ac_qstep_y);
+                     if (eob > 0) {
+                        int ci;
+                        fprintf(stderr, "  First 8 coeffs: ");
+                        for (ci = 0; ci < (eob < 8 ? eob : 8); ++ci)
+                           fprintf(stderr, "%d ", coeffs[ci]);
+                        fprintf(stderr, "\n");
+                     }
+                  }
                 /* Update entropy context with cul_level */
                for (ti = 0; ti < tx_w_mi && mi_tx_col + ti < ctx->mi_cols; ti++)
                   ctx->above_entropy[0][mi_tx_col + ti] = (unsigned char)cul_level;
@@ -11692,23 +11673,25 @@ static int stbi_avif__av1_decode_coding_unit(stbi_avif__av1_decode_ctx *ctx,
                      dc_sign_ctx_uv = dc_sign_contexts[dc_sign_sum + 32];
                   }
 
-                  /* Compute txb_skip_ctx for UV: get_entropy_context(tx_size,a,l) + offset */
-                  {
-                     int above_ec = 0, left_ec = 0;
-                     /* For square TX: OR together txb_w_unit entries and check nonzero */
-                     for (ti = 0; ti < uv_w_mi && mi_tx_col_uv + ti < (ctx->mi_cols >> (unsigned)ctx->planes->subx); ti++)
-                        above_ec |= ctx->above_entropy[p][mi_tx_col_uv + ti];
-                     above_ec = above_ec != 0 ? 1 : 0;
-                     { unsigned int sb_uv_h = sb_mi_val >> (unsigned)ctx->planes->suby;
-                     for (ti = 0; ti < uv_h_mi && (mi_tx_row_uv % sb_uv_h) + ti < sb_uv_h; ti++)
-                        left_ec |= ctx->left_entropy[p][(mi_tx_row_uv % sb_uv_h) + ti];
-                     left_ec = left_ec != 0 ? 1 : 0; }
-                     {
-                        /* ctx_offset: 10 if plane_bsize > tx_bsize, else 7 */
-                        int ctx_offset = (cpw_mi > uv_w_mi || cph_mi > uv_h_mi) ? 10 : 7;
-                        txb_skip_ctx_uv = (above_ec + left_ec) + ctx_offset;
-                     }
-                  }
+                   /* Compute txb_skip_ctx for UV: get_entropy_context(tx_size,a,l) + offset */
+                   {
+                      int above_ec = 0, left_ec = 0;
+                      /* For square TX: OR together txb_w_unit entries and extract coeff context */
+                      for (ti = 0; ti < uv_w_mi && mi_tx_col_uv + ti < (ctx->mi_cols >> (unsigned)ctx->planes->subx); ti++)
+                         above_ec |= ctx->above_entropy[p][mi_tx_col_uv + ti];
+                      above_ec &= 0x07; /* COEFF_CONTEXT_MASK = 7 */
+                      if (above_ec > 4) above_ec = 4;
+                      { unsigned int sb_uv_h = sb_mi_val >> (unsigned)ctx->planes->suby;
+                      for (ti = 0; ti < uv_h_mi && (mi_tx_row_uv % sb_uv_h) + ti < sb_uv_h; ti++)
+                         left_ec |= ctx->left_entropy[p][(mi_tx_row_uv % sb_uv_h) + ti];
+                      left_ec &= 0x07;
+                      if (left_ec > 4) left_ec = 4; }
+                      {
+                         /* ctx_offset: 10 if plane_bsize > tx_bsize, else 7 */
+                         int ctx_offset = (cpw_mi > uv_w_mi || cph_mi > uv_h_mi) ? 10 : 7;
+                         txb_skip_ctx_uv = (above_ec + left_ec) + ctx_offset;
+                      }
+                   }
 
                   {
                   int uv_log2w_tx = (uv_tx_szw==32?3:uv_tx_szw==16?2:uv_tx_szw==8?1:0);

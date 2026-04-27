@@ -48,7 +48,9 @@ int test_2d_idct_dc_scaling() {
     printf("\n=== 2D IDCT DC scaling test ===\n");
     for (i = 0; i < 4; i++) {
         int sz = tx_sizes[i];
-        int expected = 1024 / (sz * sz);
+        /* AV1 transform convention: output is 2x orthonormal DCT.
+         * Total scaling = txw * txh / 2, so DC output = input * 2 / (txw * txh) */
+        int expected = (1024 * 2) / (sz * sz);
         int all_flat = 1;
         
         memset(coeffs, 0, sizeof(coeffs));

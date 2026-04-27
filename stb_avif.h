@@ -10247,19 +10247,25 @@ static void stbi_avif__av1_inverse_transform_2d_rect(int *coeffs, int txw, int t
        }
     }
 
-   /* Determine column shift based on transform type and size.
-    * For IDTX: identity4/8 multiply by 2 per dim (total 4, shift 2);
-    * identity16 multiplies by 2*sqrt(2) per dim (total 8, shift 3);
-    * identity32/64 multiply by 4 per dim (total 16, shift 4).
-    * For DCT/ADST: shift 4 is correct. */
-    {
-        int col_shift = 4;
-        if (tx_type == 9 || tx_type == 10 || tx_type == 11) {
-           int max_dim = (txw > txh) ? txw : txh;
-           if (max_dim <= 8)       col_shift = 2;
-           else if (max_dim <= 16) col_shift = 3;
-           else                    col_shift = 4;
-        }
+    /* Determine column shift based on transform type and size.
+     * For IDTX: identity4/8 multiply by 2 per dim (total 4, shift 2);
+     * identity16 multiplies by 2*sqrt(2) per dim (total 8, shift 3);
+     * identity32/64 multiply by 4 per dim (total 16, shift 4).
+     * For DCT/ADST: col_shift = log2(txw) + log2(txh) - 1 - row_shift
+     * so that total scaling = 2^(row_shift + col_shift + 1) = txw * txh */
+     {
+         int col_shift;
+         if (tx_type == 9 || tx_type == 10 || tx_type == 11) {
+            int max_dim = (txw > txh) ? txw : txh;
+            if (max_dim <= 8)       col_shift = 2;
+            else if (max_dim <= 16) col_shift = 3;
+            else                    col_shift = 4;
+         } else {
+            int lw = 0, lh = 0, t = txw;
+            while (t > 1) { ++lw; t >>= 1; }
+            t = txh; while (t > 1) { ++lh; t >>= 1; }
+            col_shift = lw + lh - 1 - row_shift;
+         }
        /* Column transforms: for each column j (0..txw-1), apply txh-point col transform */
        for (j = 0; j < txw; ++j) {
        int out[64];

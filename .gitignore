@@ -1,6 +1,20 @@
-output
-output_png
-tests/test_decode
-test_decode_run
-.DS_Store
-__pycache__
+# Binaries and build artifacts
+*.o
+*.a
+*.so
+*.dylib
+test_decode
+test_decode_*
+compare_y
+tools/compare_y
+tools/count_sentinel
+tools/find_first_diff
+tests/test_decode_*
+tests/test_idct
+*.dSYM/
+
+# Temporary files
+*.bak
+*.tmp
+stb_avif.h.*
+out.ppm

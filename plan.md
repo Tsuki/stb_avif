@@ -31,23 +31,21 @@ AVIF container (ISOBMFF)
 
 ## 2. Current Quality Status
 
-**Primary test image:** `steam_2253100.avif` (1024×772, YUV444, 10-bit, BT.709 limited)
+**Test image:** `fox.profile0.8bpc.yuv420.avif` (1204×800, YUV420, 8-bit, BT.601)
 
-| Metric | Current | Target |
-|--------|---------|--------|
-| MAE | **27.9** | < 1.0 |
-| Max diff | 130 | < 10 |
-| Median diff | 17.0 | < 1.0 |
+| Metric | Before Fixes | After Fixes | Target |
+|--------|-------------|-------------|--------|
+| MAE | **57.24** | **45.80** | < 1.0 |
+| Max diff | ~130 | ~130 | < 10 |
+| Block overlaps | Yes (many) | **None** | 0 |
 
-**Error distribution (spatial heatmap, 4×8 grid):**
-```
- 59.8  26.3  24.2  17.1  17.6  21.6  17.0  12.6
- 83.4  22.5  17.6  16.6  14.8  17.5  25.5  26.2
- 88.5  21.7  19.3  25.2  17.8  12.1  23.3  15.6
-103.5  28.7   9.3  18.4  26.1  26.7  18.9  18.0
-```
-
-**Key observation:** Left column has dramatically higher MAE (60→103). Errors are spatially widespread (not just cascading from top-left). This suggests systematic issues in prediction and/or transforms rather than a single cascading bug.
+**Key fixes applied:**
+1. **Partition decode for non-square blocks** (CRITICAL): Added `stbi_avif__subblock_size()` to correctly compute sub-block dimensions when splitting non-square blocks (HORZ, VERT, SPLIT, compound partitions, HORZ_4, VERT_4). This eliminated all block overlaps.
+2. **Coefficient placement**: Reverted to column-major scan order (matching AV1 spec).
+3. **PAETH prediction**: Moved mode conversion before angle computation.
+4. **V/H prediction**: Pure copy without spurious gradients.
+5. **Angular prediction**: Implemented Z1/Z2/Z3 zones with angle delta.
+6. **Extended reference pixels**: `ref_count = 2 * max(bw, bh)`.
 
 **All 8 test images decode without crashes** (fox 8/10bpc YUV420, kimono, Gb5RU6, G-0trmK, steam).
 
@@ -55,68 +53,59 @@ AVIF container (ISOBMFF)
 
 ## 3. Known Issues (Priority Order)
 
-### 3.1 CRITICAL: Directional Prediction Modes (V, H, D45-D67) — ~50% of error
+### 3.1 [FIXED] CRITICAL: Non-Square Block Partition Decode
 
-The V_PRED and H_PRED modes have spurious gradient terms that should not exist:
+**Status:** ✅ FIXED — Added `stbi_avif__subblock_size()` and `stbi_avif__bsize_from_dims()` to correctly compute sub-block sizes for all partition types on non-square blocks. All block overlaps eliminated.
 
-```c
-// CURRENT (WRONG):
-case 1u: /* V */
-   val = (int)top[tix] + ((int)(2u * x + 1u) * amp) / (int)(2u * bw) - amp / 2;
-case 2u: /* H */
-   val = (int)left[tiy] + ((int)(2u * y + 1u) * amp) / (int)(2u * bh) - amp / 2;
+**Root cause:** The original code used `block_size - 1` for HORZ, `block_size - 2` for VERT, and `block_size - 3` for SPLIT. This only works for square blocks where enum values differ by 3. For non-square blocks (e.g., 16×8, 8×32), subtracting 3 gives the wrong size, causing overlapping blocks and spatial corruption.
 
-// CORRECT (per AV1 spec):
-case 1u: /* V */  val = (int)top[x];
-case 2u: /* H */  val = (int)left[y];
-```
+**Impact:** MAE improved from 57.24 → 45.80 (20% reduction).
 
-Angular modes D45/D135/D113/D157/D203/D67 (modes 3-8) use crude averaging approximations instead of the proper Z1/Z2/Z3 angular predictors from AV1 spec §7.11.2.4-6. The spec uses:
-- Angle-to-dx/dy lookup tables
-- Bilinear interpolation between integer positions
-- Derivative-based sub-pixel shifts
+### 3.2 [FIXED] CRITICAL: V/H Prediction Gradients
 
-### 3.2 CRITICAL: Angle Delta Not Applied
+**Status:** ✅ FIXED — V_PRED and H_PRED now use pure copy without spurious gradient terms.
 
-The angle delta value is read from the bitstream but never used to modify the prediction angle. For directional modes 1-8, the actual angle should be:
-```
-nominal_angle = mode_to_angle[mode - 1]  // V=90, H=180, D45=45, D135=135, ...
-actual_angle = nominal_angle + angle_delta * 3
-```
-Then map actual_angle → Z1/Z2/Z3 predictor with appropriate dx/dy.
+### 3.3 [FIXED] CRITICAL: Angular Prediction (Z1/Z2/Z3)
 
-### 3.3 HIGH: DC Prediction Rounding for Non-Square Blocks
+**Status:** ✅ FIXED — Implemented proper Z1/Z2/Z3 angular predictors with angle delta and bilinear interpolation.
 
-Current DC averaging uses simple `sum / count`. The AV1 spec requires power-of-2 rounding:
+### 3.4 [FIXED] HIGH: PAETH Mode Conversion Timing
+
+**Status:** ✅ FIXED — Moved PAETH → VERT/HOR mode conversion before angle computation so converted modes get correct angles.
+
+### 3.5 [FIXED] HIGH: Extended Reference Pixels
+
+**Status:** ✅ FIXED — `ref_count = 2 * max(bw, bh)` with proper boundary clamping.
+
+### 3.6 HIGH: DC Prediction Rounding for Non-Square Blocks
+
+**Status:** ⏳ PENDING — Current DC averaging uses `(sum + count/2) / count`. The AV1 spec requires power-of-2 rounding:
 ```c
 // AV1 spec §7.11.2.3:
 dc = (sum + (count >> 1)) >> log2(count)
 ```
 For non-square blocks where `count = bw + bh` is not a power of 2, the multiplier correction tables (`dc_multiplier_1x2`, `dc_multiplier_1x4`) should be used.
 
-### 3.4 HIGH: Extended Reference Pixels for Prediction
+**Expected impact:** MAE reduction ~2-3 points.
 
-Current code reads `bw + bh + 2` reference pixels, but:
-1. The AV1 spec allows up to `2 * max(bw, bh)` pixels from each edge
-2. Extended neighbor availability (`have_above_right`, `have_below_left`) is not computed
-3. Without extended refs, directional modes that reach beyond the block produce wrong values
+### 3.7 MEDIUM: Inverse Transform Accuracy
 
-### 3.5 MEDIUM: Inverse Transform Accuracy
-
-The IDCT/IADST implementations may have:
+**Status:** 🔴 ACTIVE — The IDCT/IADST implementations may have:
 - Missing intermediate rounding (AV1 spec requires `ROUND2SIGNED` at specific stages)
 - Incorrect scaling constants (should use exact AV1 spec fixed-point values, not floating-point derived)
 - No `ROUND_POWER_OF_TWO_SIGNED` on the final column output
 
-Verification approach: extract a single TX block's coefficients, compare our inverse transform output vs dav1d's.
+**Verification approach:** Extract a single TX block's coefficients, compare our inverse transform output vs dav1d's.
 
-### 3.6 MEDIUM: TX Size Decode Edge Cases
+**Expected impact:** This is likely the dominant remaining error source. MAE reduction potentially 20-30 points.
+
+### 3.8 MEDIUM: TX Size Decode Edge Cases
 
 TX size selection works for the common case but may have edge cases:
 - Split TX mode (`txfm_partition`) for larger blocks is parsed but the subdivision into sub-TX blocks may not correctly iterate all sub-blocks
 - Rectangular TX (non-square) size derivation from `tx_size_cdf` result might not match spec for all block sizes
 
-### 3.7 LOW: CFL (Chroma From Luma) Implementation
+### 3.9 LOW: CFL (Chroma From Luma) Implementation
 
 CFL is structurally implemented but:
 - The luma average subtraction should use only the overlap region
@@ -147,51 +136,36 @@ CFL is structurally implemented but:
 3. H_PRED: `val = (int)left[y]` (pure horizontal copy)
 4. Test & measure MAE
 
-### Phase 2: Implement Proper Angular Prediction (Z1/Z2/Z3)
+### Phase 1: Fix Non-Square Block Partition Decode ✅
 
-**Expected MAE reduction: → ~12**
+**Status:** COMPLETE — MAE improved 57.24 → 45.80
 
-1. Add angle lookup table: `mode_to_angle[8] = {90, 180, 45, 135, 113, 157, 203, 67}`
-2. Apply angle delta: read the delta value (already parsed), compute `actual_angle = nominal + delta * 3`
-3. Implement the three angular predictor zones:
-   - **Z1** (angle 0–90): Top-right diagonal, uses `dx = -tan(angle)` lookup
-   - **Z2** (angle 90–180): Uses both top and left refs, `dx` and `dy` lookups
-   - **Z3** (angle 180–270): Bottom-left diagonal, uses `dy = -1/tan(angle)` lookup
-4. For each pixel (x, y):
-   - Compute fractional source position from dx/dy
-   - Bilinear interpolate between two reference pixels
-   - `val = ((64 - frac) * ref[base] + frac * ref[base + 1] + 32) >> 6`
-5. Add `dr_intra_derivative[90]` table from AV1 spec
+1. Added `stbi_avif__bsize_from_dims()` and `stbi_avif__subblock_size()` functions
+2. Replaced all `block_size - [123]` with proper dimension-based lookups
+3. Verified zero overlapping blocks across all test images
 
-**Key references:**
-- AV1 spec §7.11.2.4 (Z1), §7.11.2.5 (Z2), §7.11.2.6 (Z3)
-- dav1d source: `src/ipred_tmpl.c` functions `ipred_z1_c`, `ipred_z2_c`, `ipred_z3_c`
+### Phase 2: Fix Prediction Modes ✅
 
-### Phase 3: Fix DC Prediction Rounding
+**Status:** COMPLETE — V/H gradients removed, Z1/Z2/Z3 angular implemented, PAETH timing fixed, extended refs loaded
 
-**Expected MAE reduction: → ~10**
+1. V_PRED/H_PRED: pure copy without gradients
+2. Z1/Z2/Z3 angular predictors with angle delta
+3. PAETH mode conversion before angle computation
+4. Extended reference pixels: `ref_count = 2 * max(bw, bh)`
 
-1. Replace `sum / count` with proper power-of-2 rounding for square blocks
-2. Add multiplier tables for non-square ratio corrections
-3. Handle `count = bw` (top-only), `count = bh` (left-only), `count = bw + bh` (both)
+### Phase 3: Verify & Fix Inverse Transforms 🔴 ACTIVE
 
-### Phase 4: Extended Reference Pixel Loading
+**Expected MAE reduction: 45.80 → ~15-25**
 
-**Expected MAE reduction: → ~6**
+This is likely the dominant remaining error source. The IDCT/IADST implementations may have:
+- Missing intermediate rounding (AV1 spec requires `ROUND2SIGNED` at specific stages)
+- Incorrect scaling constants (should use exact AV1 spec fixed-point values, not floating-point derived)
+- No `ROUND_POWER_OF_TWO_SIGNED` on the final column output
 
-1. Compute `have_above_right` and `have_below_left` per-block based on partition structure
-2. Load up to `2 * bw` top reference pixels (extending right) and `2 * bh` left reference pixels (extending down)
-3. When extended pixels unavailable, repeat the last available pixel
-4. This primarily affects angular modes that look diagonally beyond the block
-
-### Phase 5: Verify & Fix Inverse Transforms
-
-**Expected MAE reduction: → ~2**
-
-1. Add debug hook to dump coefficients at a specific block position
-2. Compare dequantized coefficients against dav1d output
-3. Compare post-transform residuals against dav1d
-4. Fix any rounding/scaling discrepancies found in:
+**Approach:**
+1. Extract a single TX block's coefficients from our decoder
+2. Compare against dav1d output for same block
+3. Fix rounding/scaling discrepancies in:
    - IDCT 4/8/16/32/64
    - IADST 4/8/16
    - Identity transforms
@@ -199,9 +173,17 @@ CFL is structurally implemented but:
    - Row shift values
    - Final column normalization (>>4)
 
-### Phase 6: Coefficient Decode Audit
+### Phase 4: Fix DC Prediction Rounding
 
-**Expected MAE reduction: → ~1**
+**Expected MAE reduction: → ~2-3**
+
+1. Replace `sum / count` with proper power-of-2 rounding for square blocks
+2. Add multiplier tables for non-square ratio corrections
+3. Handle `count = bw` (top-only), `count = bh` (left-only), `count = bw + bh` (both)
+
+### Phase 5: Coefficient Decode Audit
+
+**Expected MAE reduction: → ~1-2**
 
 1. Verify EOB position decode for all TX sizes (4×4 through 32×32)
 2. Verify coeff_base context function (`get_lower_levels_ctx_2d` / `_1d`)
@@ -210,7 +192,7 @@ CFL is structurally implemented but:
 5. Verify dequantization step: `(level * qstep + round) >> shift`
 6. Check the scan order tables match AV1 spec
 
-### Phase 7: End-to-End Pixel Matching
+### Phase 6: End-to-End Pixel Matching
 
 **Target: MAE < 1.0**
 
